@@ -1,4 +1,4 @@
-module github.com/mwhaITU/gRPC.git
+module github.com/mwhaITU/DSYSPrep/ReplicatedChat
 
 go 1.19
 

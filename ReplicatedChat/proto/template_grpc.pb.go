@@ -18,10 +18,8 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type TemplateClient interface {
-	// one message is sent and one is recieved
-	Increment(ctx context.Context, in *Amount, opts ...grpc.CallOption) (*Ack, error)
-	// many messages are sent and one is recieved
-	SayHi(ctx context.Context, opts ...grpc.CallOption) (Template_SayHiClient, error)
+	JoinChat(ctx context.Context, in *Message, opts ...grpc.CallOption) (Template_JoinChatClient, error)
+	SendMessage(ctx context.Context, opts ...grpc.CallOption) (Template_SendMessageClient, error)
 }
 
 type templateClient struct {
@@ -32,43 +30,66 @@ func NewTemplateClient(cc grpc.ClientConnInterface) TemplateClient {
 	return &templateClient{cc}
 }
 
-func (c *templateClient) Increment(ctx context.Context, in *Amount, opts ...grpc.CallOption) (*Ack, error) {
-	out := new(Ack)
-	err := c.cc.Invoke(ctx, "/proto.Template/Increment", in, out, opts...)
+func (c *templateClient) JoinChat(ctx context.Context, in *Message, opts ...grpc.CallOption) (Template_JoinChatClient, error) {
+	stream, err := c.cc.NewStream(ctx, &Template_ServiceDesc.Streams[0], "/proto.Template/JoinChat", opts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
-}
-
-func (c *templateClient) SayHi(ctx context.Context, opts ...grpc.CallOption) (Template_SayHiClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Template_ServiceDesc.Streams[0], "/proto.Template/SayHi", opts...)
-	if err != nil {
+	x := &templateJoinChatClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
-	x := &templateSayHiClient{stream}
-	return x, nil
-}
-
-type Template_SayHiClient interface {
-	Send(*Greeding) error
-	CloseAndRecv() (*Farewell, error)
-	grpc.ClientStream
-}
-
-type templateSayHiClient struct {
-	grpc.ClientStream
-}
-
-func (x *templateSayHiClient) Send(m *Greeding) error {
-	return x.ClientStream.SendMsg(m)
-}
-
-func (x *templateSayHiClient) CloseAndRecv() (*Farewell, error) {
 	if err := x.ClientStream.CloseSend(); err != nil {
 		return nil, err
 	}
-	m := new(Farewell)
+	return x, nil
+}
+
+type Template_JoinChatClient interface {
+	Recv() (*Message, error)
+	grpc.ClientStream
+}
+
+type templateJoinChatClient struct {
+	grpc.ClientStream
+}
+
+func (x *templateJoinChatClient) Recv() (*Message, error) {
+	m := new(Message)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *templateClient) SendMessage(ctx context.Context, opts ...grpc.CallOption) (Template_SendMessageClient, error) {
+	stream, err := c.cc.NewStream(ctx, &Template_ServiceDesc.Streams[1], "/proto.Template/SendMessage", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &templateSendMessageClient{stream}
+	return x, nil
+}
+
+type Template_SendMessageClient interface {
+	Send(*Message) error
+	CloseAndRecv() (*Ack, error)
+	grpc.ClientStream
+}
+
+type templateSendMessageClient struct {
+	grpc.ClientStream
+}
+
+func (x *templateSendMessageClient) Send(m *Message) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *templateSendMessageClient) CloseAndRecv() (*Ack, error) {
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	m := new(Ack)
 	if err := x.ClientStream.RecvMsg(m); err != nil {
 		return nil, err
 	}
@@ -79,10 +100,8 @@ func (x *templateSayHiClient) CloseAndRecv() (*Farewell, error) {
 // All implementations must embed UnimplementedTemplateServer
 // for forward compatibility
 type TemplateServer interface {
-	// one message is sent and one is recieved
-	Increment(context.Context, *Amount) (*Ack, error)
-	// many messages are sent and one is recieved
-	SayHi(Template_SayHiServer) error
+	JoinChat(*Message, Template_JoinChatServer) error
+	SendMessage(Template_SendMessageServer) error
 	mustEmbedUnimplementedTemplateServer()
 }
 
@@ -90,11 +109,11 @@ type TemplateServer interface {
 type UnimplementedTemplateServer struct {
 }
 
-func (UnimplementedTemplateServer) Increment(context.Context, *Amount) (*Ack, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Increment not implemented")
+func (UnimplementedTemplateServer) JoinChat(*Message, Template_JoinChatServer) error {
+	return status.Errorf(codes.Unimplemented, "method JoinChat not implemented")
 }
-func (UnimplementedTemplateServer) SayHi(Template_SayHiServer) error {
-	return status.Errorf(codes.Unimplemented, "method SayHi not implemented")
+func (UnimplementedTemplateServer) SendMessage(Template_SendMessageServer) error {
+	return status.Errorf(codes.Unimplemented, "method SendMessage not implemented")
 }
 func (UnimplementedTemplateServer) mustEmbedUnimplementedTemplateServer() {}
 
@@ -109,44 +128,47 @@ func RegisterTemplateServer(s grpc.ServiceRegistrar, srv TemplateServer) {
 	s.RegisterService(&Template_ServiceDesc, srv)
 }
 
-func _Template_Increment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(Amount)
-	if err := dec(in); err != nil {
-		return nil, err
+func _Template_JoinChat_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(Message)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
 	}
-	if interceptor == nil {
-		return srv.(TemplateServer).Increment(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/proto.Template/Increment",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(TemplateServer).Increment(ctx, req.(*Amount))
-	}
-	return interceptor(ctx, in, info, handler)
+	return srv.(TemplateServer).JoinChat(m, &templateJoinChatServer{stream})
 }
 
-func _Template_SayHi_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(TemplateServer).SayHi(&templateSayHiServer{stream})
-}
-
-type Template_SayHiServer interface {
-	SendAndClose(*Farewell) error
-	Recv() (*Greeding, error)
+type Template_JoinChatServer interface {
+	Send(*Message) error
 	grpc.ServerStream
 }
 
-type templateSayHiServer struct {
+type templateJoinChatServer struct {
 	grpc.ServerStream
 }
 
-func (x *templateSayHiServer) SendAndClose(m *Farewell) error {
+func (x *templateJoinChatServer) Send(m *Message) error {
 	return x.ServerStream.SendMsg(m)
 }
 
-func (x *templateSayHiServer) Recv() (*Greeding, error) {
-	m := new(Greeding)
+func _Template_SendMessage_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(TemplateServer).SendMessage(&templateSendMessageServer{stream})
+}
+
+type Template_SendMessageServer interface {
+	SendAndClose(*Ack) error
+	Recv() (*Message, error)
+	grpc.ServerStream
+}
+
+type templateSendMessageServer struct {
+	grpc.ServerStream
+}
+
+func (x *templateSendMessageServer) SendAndClose(m *Ack) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *templateSendMessageServer) Recv() (*Message, error) {
+	m := new(Message)
 	if err := x.ServerStream.RecvMsg(m); err != nil {
 		return nil, err
 	}
@@ -159,16 +181,16 @@ func (x *templateSayHiServer) Recv() (*Greeding, error) {
 var Template_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "proto.Template",
 	HandlerType: (*TemplateServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "Increment",
-			Handler:    _Template_Increment_Handler,
-		},
-	},
+	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "SayHi",
-			Handler:       _Template_SayHi_Handler,
+			StreamName:    "JoinChat",
+			Handler:       _Template_JoinChat_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "SendMessage",
+			Handler:       _Template_SendMessage_Handler,
 			ClientStreams: true,
 		},
 	},

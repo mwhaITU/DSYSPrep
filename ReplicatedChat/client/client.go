@@ -5,17 +5,31 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	gRPC "github.com/mwhaITU/DSYSPrep/proto"
+	"github.com/mwhaITU/DSYSPrep/ReplicatedChat/proto"
+	gRPC "github.com/mwhaITU/DSYSPrep/ReplicatedChat/proto"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+type nodeConnection struct {
+	node     gRPC.TemplateClient
+	nodeConn *grpc.ClientConn
+}
+
+type node struct {
+	nodeID    string
+	lamport   int32
+	nodeSlice []nodeConnection
+	mutex     sync.Mutex
+}
 
 // Same principle as in client. Flags allows for user specific arguments/values
 var clientsName = flag.String("name", "default", "Senders name")
@@ -23,6 +37,8 @@ var serverPort = flag.String("server", "5400", "Tcp server")
 
 var server gRPC.TemplateClient  //the server
 var ServerConn *grpc.ClientConn //the server connection
+
+var LamportClock int32
 
 func main() {
 	//parse flag/arguments
@@ -33,18 +49,23 @@ func main() {
 	//log to file instead of console
 	//setLog()
 
+	node := node{
+		nodeID:    string(*clientsName),
+		nodeSlice: make([]nodeConnection, 0),
+		lamport:   1,
+	}
+
 	//connect to server and close the connection when program closes
 	fmt.Println("--- join Server ---")
-	ConnectToServer()
-	defer ServerConn.Close()
 
-	//start the biding
-	parseInput()
+	ctx := context.Background()
+	go node.parseInput(ctx, server)
+	for {
+		time.Sleep(5 * time.Second)
+	}
 }
 
-// connect to server
-func ConnectToServer() {
-
+func (n *node) ConnectToNode(port string) {
 	//dial options
 	//the server is not using TLS, so we use insecure credentials
 	//(should be fine for local testing but not in the real world)
@@ -56,8 +77,9 @@ func ConnectToServer() {
 	defer cancel() //cancel the connection when we are done
 
 	//dial the server to get a connection to it
-	log.Printf("client %s: Attempts to dial on port %s\n", *clientsName, *serverPort)
-	conn, err := grpc.DialContext(timeContext, fmt.Sprintf(":%s", *serverPort), opts...)
+	log.Printf("client %v: Attempts to dial on port %v\n", n.nodeID, port)
+	// Insert your device's IP before the colon in the print statement
+	conn, err := grpc.DialContext(timeContext, fmt.Sprintf(":%s", port), opts...)
 	if err != nil {
 		log.Printf("Fail to Dial : %v", err)
 		return
@@ -65,88 +87,114 @@ func ConnectToServer() {
 
 	// makes a client from the server connection and saves the connection
 	// and prints rather or not the connection was is READY
-	server = gRPC.NewTemplateClient(conn)
-	ServerConn = conn
+	nodeConnection := nodeConnection{
+		node:     gRPC.NewTemplateClient(conn),
+		nodeConn: conn,
+	}
+
+	n.nodeSlice = append(n.nodeSlice, nodeConnection)
 	log.Println("the connection is: ", conn.GetState().String())
 }
 
-func parseInput() {
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("Type the amount you wish to increment with here. Type 0 to get the current value")
-	fmt.Println("--------------------")
+func DisconnectFromServer() {
+	ctx := context.Background()
+	server := proto.NewTemplateClient(ServerConn)
+	SendMessage(ctx, server, "close")
+	log.Printf("Closing connection to server from %v", *clientsName)
+	LamportClock = 0
+}
+
+func (n *node) parseInput(ctx context.Context, server gRPC.TemplateClient) {
+	reader := bufio.NewReaderSize(os.Stdin, 128)
+	client := proto.NewTemplateClient(ServerConn)
 
 	//Infinite loop to listen for clients input.
 	for {
-		fmt.Print("-> ")
-
 		//Read input into var input and any errors into err
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			log.Fatal(err)
 		}
 		input = strings.TrimSpace(input) //Trim input
-
+		if len(input) > 128 {
+			fmt.Println("Message must be shorter than 128 characters. Please try again...")
+			continue
+		}
+		if strings.Contains(input, "connect") {
+			portString := input[8:12]
+			if err != nil {
+				// ... handle error
+				panic(err)
+			}
+			n.ConnectToNode(portString)
+			continue
+		}
+		if input == "join" {
+			go joinChat(ctx, client)
+			break
+		}
+		if input == "close" {
+			DisconnectFromServer()
+			break
+		}
 		if !conReady(server) {
 			log.Printf("Client %s: something was wrong with the connection to the server :(", *clientsName)
 			continue
 		}
+		SendMessage(ctx, server, input)
 
-		//Convert string to int64, return error if the int is larger than 32bit or not a number
-		val, err := strconv.ParseInt(input, 10, 64)
-		if err != nil {
-			if input == "hi" {
-				sayHi()
+		continue
+	}
+}
+
+func joinChat(ctx context.Context, server proto.TemplateClient) {
+	ack := proto.Message{Sender: *clientsName}
+	stream, err := server.JoinChat(ctx, &ack)
+	if err != nil {
+		log.Fatalf("client.JoinChat(ctx, &channel) throws: %v", err)
+	}
+	fmt.Printf("Joined server: %v \n", *clientsName)
+	SendMessage(ctx, server, "join")
+	waitc := make(chan struct{})
+
+	go func() {
+		for {
+			in, err := stream.Recv()
+			if err == io.EOF {
+				fmt.Println("not working")
+				close(waitc)
+				return
 			}
-			continue
+			if err != nil {
+				log.Fatalf("Failed to receive message from channel joining. \nErr: %v", err)
+			}
+			if in.Lamport > LamportClock {
+				LamportClock = in.Lamport
+			}
+			LamportClock++
+			fmt.Printf("Lamport: %v, Message from %v: %v \n", LamportClock, in.Sender, in.Message)
+			fmt.Println("--------------------")
 		}
-		incrementVal(val)
-	}
+	}()
+
+	<-waitc
 }
 
-func incrementVal(val int64) {
-	//create amount type
-	amount := &gRPC.Amount{
-		ClientName: *clientsName,
-		Value:      val, //cast from int to int32
-	}
-
-	//Make gRPC call to server with amount, and recieve acknowlegdement back.
-	ack, err := server.Increment(context.Background(), amount)
+func SendMessage(ctx context.Context, server proto.TemplateClient, message string) {
+	stream, err := server.SendMessage(ctx)
 	if err != nil {
-		log.Printf("Client %s: no response from the server, attempting to reconnect", *clientsName)
-		log.Println(err)
+		log.Printf("Cannot send message: error: %v", err)
 	}
-
-	// check if the server has handled the request correctly
-	if ack.NewValue >= val {
-		fmt.Printf("Success, the new value is now %d\n", ack.NewValue)
-	} else {
-		// something could be added here to handle the error
-		// but hopefully this will never be reached
-		fmt.Println("Oh no something went wrong :(")
+	LamportClock++
+	msg := proto.Message{
+		Message: message,
+		Sender:  *clientsName,
+		Lamport: LamportClock,
 	}
-}
+	stream.Send(&msg)
 
-func sayHi() {
-	// get a stream to the server
-	stream, err := server.SayHi(context.Background())
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	// send some messages to the server
-	stream.Send(&gRPC.Greeding{ClientName: *clientsName, Message: "Hi"})
-	stream.Send(&gRPC.Greeding{ClientName: *clientsName, Message: "How are you?"})
-	stream.Send(&gRPC.Greeding{ClientName: *clientsName, Message: "I'm fine, thanks."})
-
-	// close the stream
-	farewell, err := stream.CloseAndRecv()
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	log.Println("server says: ", farewell)
+	ack, err := stream.CloseAndRecv()
+	fmt.Printf("Message status: %v \n", ack.Acknowledgement)
 }
 
 // Function which returns a true boolean if the connection to the server is ready, and false if it's not.

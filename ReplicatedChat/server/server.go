@@ -1,19 +1,19 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	// this has to be the same as the go.mod module,
 	// followed by the path to the folder the proto file is in.
-	gRPC "github.com/mwhaITU/gRPC/proto"
+	"github.com/mwhaITU/DSYSPrep/ReplicatedChat/proto"
+	gRPC "github.com/mwhaITU/DSYSPrep/ReplicatedChat/proto"
 
 	"google.golang.org/grpc"
 )
@@ -23,8 +23,9 @@ type Server struct {
 	name                             string // Not required but useful if you want to name your server
 	port                             string // Not required but useful if your server needs to know what port it's listening to
 
-	incrementValue int64      // value that clients can increment.
-	mutex          sync.Mutex // used to lock the server to avoid race conditions.
+	channel      map[string]chan *proto.Message
+	lamportClock int32
+	mutex        sync.Mutex // used to lock the server to avoid race conditions.
 }
 
 // flags are used to get arguments from the terminal. Flags take a value, a default value and a description of the flag.
@@ -53,7 +54,7 @@ func launchServer() {
 	log.Printf("Server %s: Attempts to create listener on port %s\n", *serverName, *port)
 
 	// Create listener tcp on given port or default port 5400
-	list, err := net.Listen("tcp", fmt.Sprintf("localhost:%s", *port))
+	list, err := net.Listen("tcp", "localhost:"+*port)
 	if err != nil {
 		log.Printf("Server %s: Failed to listen on port %s: %v", *serverName, *port, err) //If it fails to listen on the port, run launchServer method again with the next value/port in ports array
 		return
@@ -66,9 +67,10 @@ func launchServer() {
 
 	// makes a new server instance using the name and port from the flags.
 	server := &Server{
-		name:           *serverName,
-		port:           *port,
-		incrementValue: 0, // gives default value, but not sure if it is necessary
+		name:         *serverName,
+		port:         *port,
+		channel:      make(map[string]chan *proto.Message),
+		lamportClock: 0,
 	}
 
 	gRPC.RegisterTemplateServer(grpcServer, server) //Registers the server to the gRPC server.
@@ -78,58 +80,61 @@ func launchServer() {
 	if err := grpcServer.Serve(list); err != nil {
 		log.Fatalf("failed to serve %v", err)
 	}
-	// code here is unreachable because grpcServer.Serve occupies the current thread.
-}
-
-// The method format can be found in the pb.go file. If the format is wrong, the server type will give an error.
-func (s *Server) Increment(ctx context.Context, Amount *gRPC.Amount) (*gRPC.Ack, error) {
-	// locks the server ensuring no one else can increment the value at the same time.
-	// and unlocks the server when the method is done.
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	// increments the value by the amount given in the request,
-	// and returns the new value.
-	s.incrementValue += int64(Amount.GetValue())
-	return &gRPC.Ack{NewValue: s.incrementValue}, nil
-}
-
-func (s *Server) SayHi(msgStream gRPC.Template_SayHiServer) error {
 	for {
-		// get the next message from the stream
-		msg, err := msgStream.Recv()
+		time.Sleep(time.Second * 5)
+	}
+}
 
-		// the stream is closed so we can exit the loop
-		if err == io.EOF {
-			break
+func (s *Server) JoinChat(msg *proto.Message, msgStream proto.Template_JoinChatServer) error {
+	msgChannel := make(chan *proto.Message)
+	s.channel[msg.Sender] = msgChannel
+	for {
+		select {
+		case <-msgStream.Context().Done():
+			return nil
+		case msg := <-msgChannel:
+			s.lamportClock++
+			msg.Lamport = s.lamportClock
+			msgStream.Send(msg)
 		}
-		// some other error
-		if err != nil {
-			return err
-		}
-		// log the message
-		log.Printf("Received message from %s: %s", msg.ClientName, msg.Message)
+	}
+}
+
+func (s *Server) SendMessage(msgStream gRPC.Template_SendMessageServer) error {
+	msg, err := msgStream.Recv()
+
+	if err == io.EOF {
+		return nil
 	}
 
-	// be a nice server and say goodbye to the client :)
-	ack := &gRPC.Farewell{Message: "Goodbye"}
-	msgStream.SendAndClose(ack)
+	if err != nil {
+		return err
+	}
+	if msg.Lamport > s.lamportClock {
+		s.lamportClock = msg.Lamport
+	}
+	log.Printf("Received message: %v \n", msg)
+	s.lamportClock++
+	if msg.Message == "close" {
+		delete(s.channel, msg.Sender)
+		log.Printf("Closing connection to client %v", msg.Sender)
+		ack := proto.Ack{Acknowledgement: "DISCONNECTED"}
+		msgStream.SendAndClose(&ack)
+		msg.Message = "Participant " + msg.Sender + " has left Chat at Lamport time " + strconv.Itoa(int(s.lamportClock))
+	} else if msg.Message == "join" {
+		log.Printf("Participant %v has joined Chat at Lamport time "+strconv.Itoa(int(s.lamportClock)), msg.Sender)
+		msg.Message = "Participant " + msg.Sender + " has joined Chat at Lamport time " + strconv.Itoa(int(s.lamportClock))
+		ack := proto.Ack{Acknowledgement: "CONNECTED"}
+		msgStream.SendAndClose(&ack)
+	} else {
+		ack := proto.Ack{Acknowledgement: "SENT"}
+		msgStream.SendAndClose(&ack)
+	}
+	go func() {
+		for _, msgChan := range s.channel {
+			msgChan <- msg
+		}
+	}()
 
 	return nil
-}
-
-// sets the logger to use a log.txt file instead of the console
-func setLog() {
-	// Clears the log.txt file when a new server is started
-	if err := os.Truncate("log.txt", 0); err != nil {
-		log.Printf("Failed to truncate: %v", err)
-	}
-
-	// This connects to the log file/changes the output of the log informaiton to the log.txt file.
-	f, err := os.OpenFile("log.txt", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("error opening file: %v", err)
-	}
-	defer f.Close()
-	log.SetOutput(f)
 }
